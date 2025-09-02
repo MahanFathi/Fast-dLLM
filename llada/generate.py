@@ -22,6 +22,22 @@ import os
 from transformers import AutoTokenizer, AutoModel
 from model.modeling_llada import LLaDAModelLM
 
+def ban_mask_id(logits, mask_id):
+    '''
+    Sets the probability of the mask token to 0 by setting its logits to negative infinity.
+    This ensures that the mask token is never selected as the output.
+    
+    Args:
+        logits: Input logits tensor of shape (..., vocab_size)
+        mask_id: Token ID of the mask token to ban
+        
+    Returns:
+        Modified logits with mask token probability set to 0
+    '''
+    logits = logits.clone()
+    logits[..., mask_id] = float('-inf')
+    return logits
+
 def add_gumbel_noise(logits, temperature):
     '''
     The Gumbel max is a method for sampling categorical distributions.
@@ -92,9 +108,9 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
             logits = model(x).logits
             mask_index[:, prompt.shape[1] + (num_block + 1) * block_length:] = 0
             if factor is None:
-                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, i] if threshold is None else None, threshold)
+                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, i] if threshold is None else None, threshold, mask_id)
             else:
-                x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor)
+                x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor, mask_id)
             x[transfer_index] = x0[transfer_index]
             i += 1
             if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0:
@@ -142,9 +158,9 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         mask_index = (x == mask_id)
         mask_index[:, current_block_end:] = 0
         if factor is None:
-            x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
+            x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold, mask_id)
         else:
-            x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
+            x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor, mask_id)
         x[transfer_index] = x0[transfer_index]
 
         new_past_key_values = []
@@ -166,15 +182,16 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 
             logits = model(x[:, current_block_start:], past_key_values=past_key_values, use_cache=True).logits
 
+            logits = ban_mask_id(logits, mask_id)
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
 
             if factor is None:
                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, 
-                                                x[:, current_block_start:], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+                                                x[:, current_block_start:], num_transfer_tokens[:, i] if threshold is None else None, threshold, mask_id)
             else:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, 
-                                                x[:, current_block_start:], None, factor)
+                                                x[:, current_block_start:], None, factor, mask_id)
             x[:, current_block_start:][transfer_index] = x0[transfer_index]
             
             i += 1
@@ -221,9 +238,9 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
         mask_index = (x == mask_id)
         mask_index[:, current_block_end:] = 0
         if factor is None:
-            x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
+            x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold, mask_id)
         else:
-            x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
+            x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor, mask_id)
         x[transfer_index] = x0[transfer_index]
         nfe += 1
 
@@ -240,17 +257,18 @@ def generate_with_dual_cache(model, prompt, steps=128, gen_length=128, block_len
 
             if factor is None:
                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, 
-                                                x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+                                                x[:, current_block_start:current_block_end], num_transfer_tokens[:, i] if threshold is None else None, threshold, mask_id)
             else:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, 
-                                                x[:, current_block_start:current_block_end], None, factor)
+                                                x[:, current_block_start:current_block_end], None, factor, mask_id)
             x[:, current_block_start:current_block_end][transfer_index] = x0[transfer_index]
             i += 1
 
     return x, nfe
 
 
-def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None):
+def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens, threshold=None, mask_id=126336):
+    logits = ban_mask_id(logits, mask_id)
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
 
@@ -278,7 +296,8 @@ def get_transfer_index(logits, temperature, remasking, mask_index, x, num_transf
                     transfer_index[j, select_index[k]] = False
     return x0, transfer_index
 
-def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, num_transfer_tokens, factor=1):
+def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, num_transfer_tokens, factor=1, mask_id=126336):
+    logits = ban_mask_id(logits, mask_id)
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
     if remasking == 'low_confidence':
